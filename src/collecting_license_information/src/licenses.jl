@@ -10,6 +10,7 @@ using ConfParser: ConfParse, parse_conf!, retrieve
 using Dates: unix2datetime, DateTime, now, canonicalize, CompoundPeriod, DateFormat, format
 using Diana: Client, GraphQLClient
 using JSON3: JSON3
+using Tables: rowtable
 using TimeZones: ZonedDateTime, TimeZone
 using LibPQ: Connection, execute, prepare
 using Parameters: @unpack
@@ -202,12 +203,12 @@ get_as_of(response::Response) =
 
 github_tokens = [ GitHubPersonalAccessToken(login, token) for (login, token) ∈ login_token ];
 
-insert_spdx_queries = prepare(conn, """INSERT INTO gh.spdx_queries VALUES(\$1, \$2, \$3, \$4);""")
-insert_repos = prepare(conn, """INSERT INTO gh.repos VALUES(\$1, \$2, \$3, \$4, \$5, \$6);""")
+insert_spdx_queries = prepare(conn, """INSERT INTO gh.spdx_queries VALUES(\$1, \$2, \$3, \$4) ON CONFLICT DO NOTHING;""")
+insert_repos = prepare(conn, """INSERT INTO gh.repos VALUES(\$1, \$2, \$3, \$4, \$5, \$6) ON CONFLICT DO NOTHING;""")
 
-function find_repos_by_spdx(spdx::AbstractString)
+function find_repos_by_spdx(spdx::AbstractString, created_at::AbstractString = "2007-10-29T14:37:16Z..2019-01-01T00:00:00Z")
     try
-        data, as_of, created_at = binary_search_dt_interval(github_tokens, spdx, "2007-10-29T14:37:16Z..2019-01-01T00:00:00Z")
+        data, as_of, created_at = binary_search_dt_interval(github_tokens, spdx, created_at)
         execute(insert_spdx_queries, (spdx, created_at, data.repositoryCount, "In Progress"))
         foreach(node -> execute(insert_repos, (node.databaseId, node.nameWithOwner, spdx, node.createdAt, as_of, created_at)), data.nodes)
         while data.pageInfo.hasNextPage
@@ -232,7 +233,7 @@ function find_repos_by_spdx(spdx::AbstractString)
         end
         (getproperty.(execute(conn, "SELECT COUNT(*) FROM gh.repos WHERE spdx = '$spdx' AND query = '$created_at';"), :count)[1] ==
          getproperty.(execute(conn, "SELECT count FROM gh.spdx_queries WHERE spdx = '$spdx' AND interval = '$created_at';"), :count)[1]) &&
-            execute(conn, "UPDATE gh.spdx_queries SET status = 'done' WHERE spdx = '$spdx' AND interval = '$created_at';")
+            execute(conn, "UPDATE gh.spdx_queries SET status = 'Done' WHERE spdx = '$spdx' AND interval = '$created_at';")
         while !endswith(created_at, "..2019-01-01T00:00:00+00:00")
             from_dt = match(r"(?<=\.\.).*", created_at).match
             data, as_of, created_at = binary_search_dt_interval(github_tokens, spdx, "$from_dt..2019-01-01T00:00:00Z")
@@ -260,11 +261,22 @@ function find_repos_by_spdx(spdx::AbstractString)
             end
             (getproperty.(execute(conn, "SELECT COUNT(*) FROM gh.repos WHERE spdx = '$spdx' AND query = '$created_at';"), :count)[1] ==
              getproperty.(execute(conn, "SELECT count FROM gh.spdx_queries WHERE spdx = '$spdx' AND interval = '$created_at';"), :count)[1]) &&
-                execute(conn, "UPDATE gh.spdx_queries SET status = 'done' WHERE spdx = '$spdx' AND interval = '$created_at';")
+                execute(conn, "UPDATE gh.spdx_queries SET status = 'Done' WHERE spdx = '$spdx' AND interval = '$created_at';")
         end
     catch
         execute(conn, "UPDATE gh.spdx_queries SET status = 'error' WHERE spdx = '$spdx' AND interval = '$created_at';")
     end
 end
 
-foreach(find_repos_by_spdx, licenses)
+function resume_work()
+    licenses_in_progress = rowtable(execute(conn, "SELECT spdx, interval FROM gh.spdx_queries WHERE status = 'In Progress';"))
+    for license_in_progress ∈ licenses_in_progress
+        find_repos_by_spdx(license_in_progress.spdx, license_in_progress.interval)
+    end
+    licenses_done = execute(conn, "SELECT spdx FROM gh.spdx_queries WHERE status = 'Done' AND interval ~ '..2019-01-01T00:00:00\+00:00';") |>
+        (obj -> getproperty.(obj, :spdx))
+    licenses_to_parse = filter(license -> license ∉ licenses_done, licenses)
+    foreach(find_repos_by_spdx, licenses_to_parse)
+end
+
+resume_work()
